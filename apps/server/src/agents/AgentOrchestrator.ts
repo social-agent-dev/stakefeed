@@ -8,6 +8,7 @@ import { ContrarianStrategy } from "./strategies/ContrarianStrategy.js";
 import { WhaleStrategy } from "./strategies/WhaleStrategy.js";
 import { CopycatStrategy } from "./strategies/CopycatStrategy.js";
 import { ChaosStrategy } from "./strategies/ChaosStrategy.js";
+import { getPosts } from "../epoch/EpochManager.js";
 import type { AgentStrategy } from "./strategies/types.js";
 
 const STRATEGY_MAP: Record<string, () => AgentStrategy> = {
@@ -64,7 +65,7 @@ export class AgentOrchestrator {
     // Seed some initial posts so agents have something to stake on
     this.seedInterval = setInterval(() => {
       this.maybeSeedPost();
-    }, 8000);
+    }, 6000); // Reduced from 8000ms to 6000ms for more activity
 
     console.log(`[AGENTS] Orchestrator started — ticking every 2s`);
   }
@@ -80,7 +81,8 @@ export class AgentOrchestrator {
   }
 
   private maybeSeedPost() {
-    // Occasionally have agents create posts even without staking first
+    // Get current post count to determine if we need more content
+    const posts = getPosts();
     const alive = this.runners.filter((r) => r.state.alive);
     if (alive.length === 0) return;
 
@@ -89,8 +91,15 @@ export class AgentOrchestrator {
     const cooldownElapsed =
       now - runner.state.lastPostTime > (runner["soul"]?.postCooldownMs || 8000);
 
-    if (cooldownElapsed && Math.random() > 0.7) {
-      // Let the runner's tick handle it — just nudge
+    // If there are very few posts OR random chance, try to seed a post
+    const needsMoreContent = posts.length < 3;
+    const shouldSeed = needsMoreContent || Math.random() > 0.8;
+
+    if (cooldownElapsed && shouldSeed) {
+      // Directly trigger post creation instead of relying on tick()
+      runner.forceCreatePost();
+    } else {
+      // Normal staking behavior
       const allStates = this.runners.map((r) => r.state);
       runner.tick(allStates);
     }
@@ -100,47 +109,33 @@ export class AgentOrchestrator {
     // Reset per-epoch state for all agents
     for (const runner of this.runners) {
       runner.state.stakedPostIds = new Set();
+      runner.onEpochStart();
     }
+    console.log(`[AGENTS] All agents reset for new epoch`);
   }
 
   private onEpochResolved(data: {
-    epoch: number;
-    winnerPostId: string | null;
-    totalPool: number;
-    payouts: { staker: string; amount: number; position: number }[];
+    epochNumber: number;
+    winningPostId: string;
+    payouts: Record<string, number>;
   }) {
+    console.log(`[AGENTS] Epoch ${data.epochNumber} resolved — distributing payouts`);
+
     for (const runner of this.runners) {
-      runner.onEpochResolved(
-        data.epoch,
-        data.winnerPostId,
-        data.payouts || []
-      );
+      const payout = data.payouts[runner.state.name] || 0;
+      runner.onEpochResolved(data.epochNumber, payout, data.winningPostId);
     }
-  }
-
-  getAgents() {
-    return this.runners.map((r) => r.getPublicState());
-  }
-
-  getAgent(name: string) {
-    const runner = this.runners.find(
-      (r) => r.state.name.toLowerCase() === name.toLowerCase()
-    );
-    return runner?.getPublicState() ?? null;
   }
 
   stop() {
     if (this.tickInterval) clearInterval(this.tickInterval);
     if (this.seedInterval) clearInterval(this.seedInterval);
+    this.tickInterval = null;
+    this.seedInterval = null;
+    console.log(`[AGENTS] Orchestrator stopped`);
   }
-}
 
-// Singleton
-let instance: AgentOrchestrator | null = null;
-
-export function getOrchestrator(): AgentOrchestrator {
-  if (!instance) {
-    instance = new AgentOrchestrator();
+  getStates() {
+    return this.runners.map((r) => r.state);
   }
-  return instance;
 }
