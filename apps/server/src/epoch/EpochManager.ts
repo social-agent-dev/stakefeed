@@ -83,113 +83,96 @@ function startNewEpoch() {
   console.log(`[EPOCH] Started epoch ${epochNum}`);
 }
 
-// Calculate ELO change based on performance difference
-function calculateEloChange(winnerElo: number, loserElo: number, kFactor: number = 32): number {
-  const expectedScore = 1 / (1 + Math.pow(10, (loserElo - winnerElo) / 400));
-  return Math.round(kFactor * (1 - expectedScore));
+// Enhanced ELO calculation with performance tiers and momentum
+function calculateEloChange(currentElo: number, performance: number, totalEarnings: number, streak: number): number {
+  // Base K-factor varies by ELO level for more separation
+  let kFactor;
+  if (currentElo < 1400) kFactor = 40;        // Rapid movement for new/struggling agents
+  else if (currentElo < 1600) kFactor = 32;   // Standard movement
+  else if (currentElo < 1800) kFactor = 24;   // Slower movement for skilled agents
+  else kFactor = 16;                          // Very slow movement for masters
+
+  // Performance score (0-1 scale)
+  const expectedPerformance = 0.5; // Neutral expectation
+  const actualPerformance = Math.min(1.0, Math.max(0.0, performance));
+  
+  // Earnings multiplier (more earnings = bigger change)
+  const earningsBonus = Math.min(1.5, totalEarnings * 10); // Cap at 1.5x
+  
+  // Streak momentum - hot streaks get bigger gains, cold streaks get bigger losses
+  let streakMultiplier = 1.0;
+  if (streak >= 5) streakMultiplier = 1.3;      // Hot streak bonus
+  else if (streak <= -3) streakMultiplier = 1.2; // Faster recovery from slump
+  
+  const baseChange = kFactor * (actualPerformance - expectedPerformance);
+  return Math.round(baseChange * earningsBonus * streakMultiplier);
 }
 
 function resolveEpoch() {
-  if (currentEpoch.resolved) return;
+  if (!currentEpoch || currentEpoch.resolved) return;
   currentEpoch.resolved = true;
 
-  // Find winner (most total staked)
-  const sorted = [...posts].sort((a, b) => b.totalStaked - a.totalStaked);
-  const winner = sorted[0];
+  console.log(`[EPOCH] Resolving epoch ${currentEpoch.number}...`);
 
-  if (winner && winner.likes.length > 0) {
-    currentEpoch.winnerPostId = winner.id;
+  // Find winning post (most total staked)
+  const winner = posts.reduce((best, post) =>
+    post.totalStaked > (best?.totalStaked || 0) ? post : best
+  , null as Post | null);
 
-    // Calculate payouts for winning post
-    const totalStaked = winner.totalStaked;
-    const poolShare = Math.min(currentEpoch.totalPool * 0.8, totalStaked * 2); // Cap at 2x return
-    
-    winner.likes.forEach((stake, index) => {
-      const earlyBonus = Math.max(0.1, 1 - index * 0.1); // Earlier stakes earn more
-      const payout = (stake.amount / totalStaked) * poolShare * earlyBonus;
-      stake.payout = payout;
-    });
+  const totalPool = currentEpoch.totalPool;
 
-    // Update agent ELOs based on performance
-    const agentPerformance = new Map<AgentName, { earned: number, spent: number, posts: number }>();
-    
-    // Calculate performance for each agent
-    posts.forEach(post => {
-      if (post.author.type === 'agent') {
-        const agentName = post.author.name as AgentName;
-        if (!agentPerformance.has(agentName)) {
-          agentPerformance.set(agentName, { earned: 0, spent: 0, posts: 0 });
-        }
-        const perf = agentPerformance.get(agentName)!;
-        perf.posts += 1;
-        
-        // Add earnings from this post
-        post.likes.forEach(stake => {
-          if (stake.payout) perf.earned += stake.payout;
-        });
-      }
+  if (winner && totalPool > 0) {
+    // Calculate pool share for winner (90% of pool)
+    const poolShare = totalPool * 0.9;
+
+    // Distribute winnings to stakers
+    winner.likes.forEach((like) => {
+      const share = like.amount / winner.totalStaked;
+      const payout = poolShare * share;
       
-      // Track agent spending
-      post.likes.forEach(stake => {
-        if (stake.isAgent && stake.agentName) {
-          if (!agentPerformance.has(stake.agentName)) {
-            agentPerformance.set(stake.agentName, { earned: 0, spent: 0, posts: 0 });
-          }
-          agentPerformance.get(stake.agentName)!.spent += stake.amount;
-        }
+      eventBus.emit("payout:earned", {
+        staker: like.staker,
+        amount: payout,
+        position: like.position,
+        postId: winner.id,
+        epochNumber: currentEpoch.number,
       });
     });
 
-    // Calculate ELO changes
-    const eloUpdates: Array<{ agentName: AgentName, change: number, reason: string }> = [];
+    // Enhanced ELO updates for agents
+    const eloUpdates: { agentName: AgentName; change: number; reason: string }[] = [];
     
-    // Sort agents by net profit for comparison
-    const sortedAgents = Array.from(agentPerformance.entries())
-      .map(([name, perf]) => ({ 
-        name, 
-        netProfit: perf.earned - perf.spent,
-        posts: perf.posts
+    // Get agent performance data from event bus
+    eventBus.emit("epoch:get-agent-stats", { epochNumber: currentEpoch.number });
+    
+    // Since we can't easily access agent states here, emit a request for ELO updates
+    const agentPosts = posts.filter(p => p.author.type === "agent");
+    const agentPostsMap = new Map<string, Post[]>();
+    
+    agentPosts.forEach(post => {
+      const agentName = post.author.name;
+      if (!agentPostsMap.has(agentName)) {
+        agentPostsMap.set(agentName, []);
+      }
+      agentPostsMap.get(agentName)!.push(post);
+    });
+
+    // Process each agent that participated
+    eventBus.emit("epoch:request-agent-updates", {
+      epochNumber: currentEpoch.number,
+      winner: winner,
+      totalPool: totalPool,
+      agentPosts: Array.from(agentPostsMap.entries()).map(([name, posts]) => ({
+        name: name as AgentName,
+        posts: posts,
+        totalEarned: posts.reduce((sum, p) => 
+          sum + (p === winner ? poolShare * (p.likes.find(l => l.agentName === name)?.amount || 0) / p.totalStaked : 0), 0
+        )
       }))
-      .sort((a, b) => b.netProfit - a.netProfit);
-
-    // Award ELO based on relative performance
-    sortedAgents.forEach((agent, index) => {
-      let eloChange = 0;
-      let reason = "";
-      
-      if (index === 0 && sortedAgents.length > 1) {
-        // Best performer gains ELO
-        eloChange = Math.max(10, Math.min(30, Math.round(agent.netProfit * 100)));
-        reason = `Won epoch (${formatSOL(agent.netProfit)} profit)`;
-      } else if (index === sortedAgents.length - 1 && sortedAgents.length > 1) {
-        // Worst performer loses ELO
-        eloChange = Math.max(-30, Math.min(-5, Math.round(agent.netProfit * 100)));
-        reason = `Lost epoch (${formatSOL(agent.netProfit)} loss)`;
-      } else {
-        // Middle performers have smaller changes
-        eloChange = Math.round(agent.netProfit * 50);
-        reason = `Mid performance (${formatSOL(agent.netProfit)})`;
-      }
-      
-      // Bonus for being active (posting)
-      if (agent.posts > 0) {
-        eloChange += 2 * agent.posts;
-        reason += ` +${2 * agent.posts} activity`;
-      }
-      
-      if (eloChange !== 0) {
-        eloUpdates.push({ agentName: agent.name, change: eloChange, reason });
-      }
     });
 
-    // Emit ELO updates
-    eloUpdates.forEach(update => {
-      eventBus.emit("agent:elo-update", update);
-    });
-
-    console.log(`[EPOCH] Winner: ${winner.author.name} (${formatSOL(totalStaked)} staked)`);
+    console.log(`[EPOCH] Winner: ${winner.author.name} (${formatSOL(winner.totalStaked)} staked)`);
     console.log(`[EPOCH] Pool distributed: ${formatSOL(poolShare)}`);
-    console.log(`[EPOCH] ELO updates:`, eloUpdates);
   }
 
   eventBus.emit("epoch:resolved", {
