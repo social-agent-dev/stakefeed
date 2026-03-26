@@ -1,14 +1,24 @@
 import { Router } from "express";
+import { getArchitectStatus, runArchitectCycle } from "../../architect/ArchitectAgent.js";
 
 const router = Router();
 
-// Will be populated once Architect is built (Phase 4)
 router.get("/commits", (_req, res) => {
-  res.json({ commits: [], message: "Architect not yet active" });
+  const { commits } = getArchitectStatus();
+  res.json({ commits });
 });
 
 router.get("/status", (_req, res) => {
-  res.json({ phase: "idle", message: "Architect not yet active" });
+  const status = getArchitectStatus();
+  res.json(status);
+});
+
+router.post("/trigger", (_req, res) => {
+  // Manually trigger an architect cycle
+  runArchitectCycle().catch((err) =>
+    console.error("[ARCHITECT] Manual trigger failed:", err)
+  );
+  res.json({ message: "Architect cycle triggered" });
 });
 
 export default router;

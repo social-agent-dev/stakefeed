@@ -1,6 +1,7 @@
 import { createApp } from "./api/server.js";
 import { startEpochLoop } from "./epoch/EpochManager.js";
 import { getOrchestrator } from "./agents/AgentOrchestrator.js";
+import { startArchitect } from "./architect/ArchitectAgent.js";
 import { env } from "./config/env.js";
 
 const { httpServer } = createApp();
@@ -12,6 +13,9 @@ startEpochLoop();
 const orchestrator = getOrchestrator();
 orchestrator.start();
 
+// Start the Architect (Claude-powered builder agent)
+startArchitect();
+
 httpServer.listen(env.PORT, () => {
   console.log(`
   ╔═══════════════════════════════════════╗
@@ -22,6 +26,7 @@ httpServer.listen(env.PORT, () => {
   ║  Network:   ${env.SOLANA_NETWORK.padEnd(24)}║
   ║  Epoch:     ${env.EPOCH_DURATION_SECS}s                       ║
   ║  Agents:    5 active                  ║
+  ║  Architect: live (10min cycles)       ║
   ╚═══════════════════════════════════════╝
   `);
 });
