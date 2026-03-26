@@ -40,35 +40,39 @@ export class AgentRunner {
     const epoch = getCurrentEpoch();
     if (!epoch || epoch.resolved) return;
 
-    // 1. Check timing window
     const elapsed = Date.now() - epoch.startTime;
     const epochProgress = elapsed / (EPOCH_DURATION_SECS * 1000);
+
+    // 1. Check if agent should post (independent of staking)
+    this.maybeCreatePost(allAgents, epochProgress);
+
+    // 2. Check timing window for staking
     const [tMin, tMax] = this.soul.timing;
     if (epochProgress < tMin || epochProgress > tMax) return;
 
-    // 2. Find posts not yet staked on by this agent
+    // 3. Find posts not yet staked on by this agent
     const posts = getPosts();
     const available = posts.filter(
       (p) => !this.state.stakedPostIds.has(p.id)
     );
     if (available.length === 0) return;
 
-    // 3. Build context
+    // 4. Build context
     const context: EpochContext = {
       epochProgress,
       posts,
       agents: allAgents,
     };
 
-    // 4. Strategy picks target
+    // 5. Strategy picks target
     const target = this.strategy.pickTarget(available, this.state, context);
     if (!target) return;
 
-    // 5. Risk check
+    // 6. Risk check
     const price = getLikePrice(target.likeCount);
     if (price > this.state.balance * this.soul.risk) return;
 
-    // 6. Execute stake
+    // 7. Execute stake
     const result = stakeOnPost(target.id, this.state.name, true, this.state.name);
     if (!("success" in result) || !result.success) return;
 
@@ -95,75 +99,112 @@ export class AgentRunner {
     };
     eventBus.emit("agent:action", { agentName: this.state.name, action });
 
-    // 7. Maybe post (cooldown + 50% chance)
+    // 8. Maybe post after staking (higher chance for engagement)
     const now = Date.now();
     const cooldownElapsed = now - this.state.lastPostTime > this.soul.postCooldownMs;
-    if (cooldownElapsed && Math.random() > 0.5) {
-      this.createPostInternal(voiceCtx);
+    if (cooldownElapsed && Math.random() > 0.2) { // Increased from 0.5 to 0.2 (80% chance)
+      const content = generatePost(this.state.name, voiceCtx);
+      const reasoning = generateReasoning(this.state.name, voiceCtx);
+
+      createPost(this.state.name, "agent", content, this.state.name);
+      this.state.lastPostTime = now;
+
+      console.log(`[AGENT] ${this.state.name} posted: "${content.slice(0, 50)}..."`);
+
+      const postAction: AgentAction = {
+        type: "post",
+        timestamp: now,
+        details: { content: content.slice(0, 100) },
+        reasoning,
+      };
+      eventBus.emit("agent:action", { agentName: this.state.name, action: postAction });
     }
   }
 
-  /** Force an agent to create a post - used by orchestrator for seeding content */
-  forceCreatePost(): void {
-    if (!this.state.alive) return;
-
-    const epoch = getCurrentEpoch();
-    if (!epoch || epoch.resolved) return;
-
+  /** Independent posting logic - agents can post without staking */
+  private maybeCreatePost(allAgents: AgentRuntimeState[], epochProgress: number): void {
     const now = Date.now();
     const cooldownElapsed = now - this.state.lastPostTime > this.soul.postCooldownMs;
+    
     if (!cooldownElapsed) return;
 
-    // Build basic context for post creation
-    const posts = getPosts();
-    const agents = [this.state]; // Minimal context
-    const elapsed = Date.now() - epoch.startTime;
-    const epochProgress = elapsed / (EPOCH_DURATION_SECS * 1000);
+    // Each agent has different posting triggers based on their personality
+    const shouldPost = this.shouldPostIndependently(allAgents, epochProgress);
     
-    const voiceCtx = this.buildVoiceContext(0, posts, agents, epochProgress);
-    this.createPostInternal(voiceCtx);
+    if (shouldPost && Math.random() > 0.7) { // 30% chance when trigger conditions are met
+      const posts = getPosts();
+      const voiceCtx = this.buildVoiceContext(0, posts, allAgents, epochProgress);
+      const content = generatePost(this.state.name, voiceCtx);
+      const reasoning = generateReasoning(this.state.name, voiceCtx);
+
+      createPost(this.state.name, "agent", content, this.state.name);
+      this.state.lastPostTime = now;
+
+      console.log(`[AGENT] ${this.state.name} posted independently: "${content.slice(0, 50)}..."`);
+
+      const postAction: AgentAction = {
+        type: "post",
+        timestamp: now,
+        details: { content: content.slice(0, 100) },
+        reasoning,
+      };
+      eventBus.emit("agent:action", { agentName: this.state.name, action: postAction });
+    }
   }
 
-  /** Internal method to handle post creation */
-  private createPostInternal(voiceCtx: VoiceContext): void {
-    const now = Date.now();
-    const content = generatePost(this.state.name, voiceCtx);
-    const reasoning = generateReasoning(this.state.name, voiceCtx);
-
-    createPost(this.state.name, "agent", content, this.state.name);
-    this.state.lastPostTime = now;
-
-    console.log(`[AGENT] ${this.state.name} posted: "${content.slice(0, 50)}..."`);
-
-    const postAction: AgentAction = {
-      type: "post",
-      timestamp: now,
-      details: { content: content.slice(0, 100) },
-      reasoning,
-    };
-    eventBus.emit("agent:action", { agentName: this.state.name, action: postAction });
-  }
-
-  /** Called at the start of each epoch */
-  onEpochStart(): void {
-    // Reset per-epoch state
-    this.state.stakedPostIds = new Set();
+  /** Determine if agent should post based on their personality and market conditions */
+  private shouldPostIndependently(allAgents: AgentRuntimeState[], epochProgress: number): boolean {
+    const posts = getPosts();
+    const recentPosts = posts.filter(p => Date.now() - p.timestamp < 30000); // Last 30 seconds
+    
+    switch (this.state.name) {
+      case "kai":
+        // Kai posts when market is moving fast or early in epoch
+        return epochProgress < 0.3 || recentPosts.length >= 2;
+        
+      case "nadia":
+        // Nadia posts when she sees contrarian opportunities
+        const agentPosts = recentPosts.filter(p => p.userType === "agent");
+        return agentPosts.length < recentPosts.length / 2; // Less agent activity than human
+        
+      case "solomon":
+        // Solomon posts rarely, only mid-epoch when things get interesting
+        return epochProgress > 0.4 && epochProgress < 0.7 && posts.length >= 3;
+        
+      case "mira":
+        // Mira posts after seeing high ELO agents post
+        const highEloAgents = allAgents.filter(a => a.elo > this.state.elo && a.name !== this.state.name);
+        const recentHighEloActivity = recentPosts.some(p => 
+          p.userType === "agent" && highEloAgents.some(a => a.name === p.author)
+        );
+        return recentHighEloActivity;
+        
+      case "juno":
+        // Juno posts randomly but more often when chaos is high
+        const chaosScore = recentPosts.length + (Math.random() * 100);
+        return chaosScore > 50;
+        
+      default:
+        return false;
+    }
   }
 
   /** Called by orchestrator after epoch resolves */
   onEpochResolved(
     epochNumber: number,
-    payout: number,
-    winnerPostId: string
+    winnerPostId: string | null,
+    payouts: { staker: string; amount: number; position: number }[]
   ): void {
-    if (payout > 0) {
+    const myPayout = payouts.find((p) => p.staker === this.state.name);
+
+    if (myPayout) {
       // Won — staked on the winning post
-      this.state.balance += payout;
+      this.state.balance += myPayout.amount;
       this.state.streak += 1;
       this.state.elo += 20 + this.state.streak * 5;
-      this.memory.push({ epoch: epochNumber, result: "W", earnings: payout });
+      this.memory.push({ epoch: epochNumber, result: "W", earnings: myPayout.amount });
       console.log(
-        `[AGENT] ${this.state.name} WON epoch ${epochNumber}: +◎${payout.toFixed(4)} (ELO: ${this.state.elo}, streak: ${this.state.streak})`
+        `[AGENT] ${this.state.name} WON epoch ${epochNumber}: +◎${myPayout.amount.toFixed(4)} (ELO: ${this.state.elo}, streak: ${this.state.streak})`
       );
     } else {
       // Lost
@@ -180,6 +221,9 @@ export class AgentRunner {
       this.state.alive = false;
       console.log(`[AGENT] ${this.state.name} ELIMINATED — bankrupt`);
     }
+
+    // Reset per-epoch state
+    this.state.stakedPostIds = new Set();
 
     // Keep memory trimmed
     if (this.memory.length > 20) this.memory = this.memory.slice(-20);
