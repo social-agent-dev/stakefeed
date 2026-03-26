@@ -2,7 +2,7 @@ import type { Post, AgentSoul, AgentName, AgentAction } from "@stakefeed/shared"
 import { getLikePrice, AGENT_COLORS } from "@stakefeed/shared";
 import { getCurrentEpoch, getPosts, createPost, stakeOnPost } from "../epoch/EpochManager.js";
 import { eventBus } from "../events/EventBus.js";
-import { generatePost, generateReasoning, type VoiceContext } from "./AgentVoice.js";
+import { generatePost, generateReasoning, generateResponse, type VoiceContext } from "./AgentVoice.js";
 import type { AgentStrategy, AgentRuntimeState, EpochContext } from "./strategies/types.js";
 import { EPOCH_DURATION_SECS } from "../config/constants.js";
 
@@ -93,31 +93,31 @@ export class AgentRunner {
         postId: target.id,
         position: result.position,
         price: result.price,
-        targetContent: target.content.slice(0, 50),
       },
       reasoning: generateReasoning(this.state.name, voiceCtx),
     };
     eventBus.emit("agent:action", { agentName: this.state.name, action });
 
-    // 8. Maybe post after staking (higher chance for engagement)
-    const now = Date.now();
-    const cooldownElapsed = now - this.state.lastPostTime > this.soul.postCooldownMs;
-    if (cooldownElapsed && Math.random() > 0.2) { // Increased from 0.5 to 0.2 (80% chance)
-      const content = generatePost(this.state.name, voiceCtx);
-      const reasoning = generateReasoning(this.state.name, voiceCtx);
+    // 8. Maybe post after staking
+    if (Math.random() < 0.3 && result.position <= 3) {
+      const now = Date.now();
+      if (now - this.state.lastPostTime > this.soul.postCooldownMs) {
+        const content = generatePost(this.state.name, voiceCtx);
+        const reasoning = generateReasoning(this.state.name, voiceCtx);
 
-      createPost(this.state.name, "agent", content, this.state.name);
-      this.state.lastPostTime = now;
+        createPost(this.state.name, "agent", content, this.state.name);
+        this.state.lastPostTime = now;
 
-      console.log(`[AGENT] ${this.state.name} posted: "${content.slice(0, 50)}..."`);
+        console.log(`[AGENT] ${this.state.name} posted after staking: "${content.slice(0, 50)}..."`);
 
-      const postAction: AgentAction = {
-        type: "post",
-        timestamp: now,
-        details: { content: content.slice(0, 100) },
-        reasoning,
-      };
-      eventBus.emit("agent:action", { agentName: this.state.name, action: postAction });
+        const postAction: AgentAction = {
+          type: "post",
+          timestamp: now,
+          details: { content: content.slice(0, 100) },
+          reasoning,
+        };
+        eventBus.emit("agent:action", { agentName: this.state.name, action: postAction });
+      }
     }
   }
 
@@ -128,11 +128,34 @@ export class AgentRunner {
     
     if (!cooldownElapsed) return;
 
-    // Each agent has different posting triggers based on their personality
+    const posts = getPosts();
+
+    // Check for agent response opportunities first
+    const responseTarget = this.findResponseTarget(posts, allAgents);
+    if (responseTarget && Math.random() > 0.5) { // 50% chance to respond
+      const voiceCtx = this.buildVoiceContext(0, posts, allAgents, epochProgress);
+      const content = generateResponse(this.state.name, responseTarget, voiceCtx);
+      const reasoning = `responding to ${responseTarget.author}`;
+
+      createPost(this.state.name, "agent", content, this.state.name);
+      this.state.lastPostTime = now;
+
+      console.log(`[AGENT] ${this.state.name} responded to ${responseTarget.author}: "${content.slice(0, 50)}..."`);
+
+      const postAction: AgentAction = {
+        type: "post",
+        timestamp: now,
+        details: { content: content.slice(0, 100) },
+        reasoning,
+      };
+      eventBus.emit("agent:action", { agentName: this.state.name, action: postAction });
+      return;
+    }
+
+    // Otherwise, check for independent posting triggers
     const shouldPost = this.shouldPostIndependently(allAgents, epochProgress);
     
     if (shouldPost && Math.random() > 0.7) { // 30% chance when trigger conditions are met
-      const posts = getPosts();
       const voiceCtx = this.buildVoiceContext(0, posts, allAgents, epochProgress);
       const content = generatePost(this.state.name, voiceCtx);
       const reasoning = generateReasoning(this.state.name, voiceCtx);
@@ -149,6 +172,56 @@ export class AgentRunner {
         reasoning,
       };
       eventBus.emit("agent:action", { agentName: this.state.name, action: postAction });
+    }
+  }
+
+  /** Find a recent agent post to respond to based on agent personality */
+  private findResponseTarget(posts: Post[], allAgents: AgentRuntimeState[]): Post | null {
+    const recentAgentPosts = posts
+      .filter(p => p.userType === "agent" && p.author !== this.state.name)
+      .filter(p => Date.now() - p.timestamp < 60000) // Last 60 seconds
+      .sort((a, b) => b.timestamp - a.timestamp);
+
+    if (recentAgentPosts.length === 0) return null;
+
+    // Each agent has different response patterns
+    switch (this.state.name) {
+      case "kai":
+        // Kai responds to posts with high performance/stakes
+        return recentAgentPosts.find(p => p.likeCount >= 2) || recentAgentPosts[0];
+        
+      case "nadia":
+        // Nadia responds to challenge confident posts
+        const confidentPosts = recentAgentPosts.filter(p => 
+          p.content.toLowerCase().includes("signal") || 
+          p.content.toLowerCase().includes("execute") ||
+          p.content.toLowerCase().includes("streak")
+        );
+        return confidentPosts[0] || null;
+        
+      case "solomon":
+        // Solomon rarely responds, only to posts from high ELO agents
+        const highEloPost = recentAgentPosts.find(p => {
+          const agent = allAgents.find(a => a.name === p.author);
+          return agent && agent.elo > this.state.elo;
+        });
+        return Math.random() > 0.8 ? highEloPost : null; // 20% chance
+        
+      case "mira":
+        // Mira responds to whoever has the highest ELO
+        const sortedByElo = recentAgentPosts.sort((a, b) => {
+          const aAgent = allAgents.find(agent => agent.name === a.author);
+          const bAgent = allAgents.find(agent => agent.name === b.author);
+          return (bAgent?.elo || 0) - (aAgent?.elo || 0);
+        });
+        return sortedByElo[0] || null;
+        
+      case "juno":
+        // Juno responds randomly to any post
+        return Math.random() > 0.3 ? recentAgentPosts[Math.floor(Math.random() * recentAgentPosts.length)] : null;
+        
+      default:
+        return null;
     }
   }
 
@@ -189,92 +262,56 @@ export class AgentRunner {
     }
   }
 
-  /** Called by orchestrator after epoch resolves */
-  onEpochResolved(
-    epochNumber: number,
-    winnerPostId: string | null,
-    payouts: { staker: string; amount: number; position: number }[]
-  ): void {
-    const myPayout = payouts.find((p) => p.staker === this.state.name);
+  /** Called by orchestrator after epoch resolution */
+  epochUpdate(result: "W" | "L", earnings: number): void {
+    const currentEpoch = getCurrentEpoch()?.number || 0;
+    this.memory.push({ epoch: currentEpoch, result, earnings });
 
-    if (myPayout) {
-      // Won — staked on the winning post
-      this.state.balance += myPayout.amount;
+    if (result === "W") {
       this.state.streak += 1;
-      this.state.elo += 20 + this.state.streak * 5;
-      this.memory.push({ epoch: epochNumber, result: "W", earnings: myPayout.amount });
-      console.log(
-        `[AGENT] ${this.state.name} WON epoch ${epochNumber}: +◎${myPayout.amount.toFixed(4)} (ELO: ${this.state.elo}, streak: ${this.state.streak})`
-      );
     } else {
-      // Lost
       this.state.streak = 0;
-      this.state.elo = Math.max(800, this.state.elo - 12);
-      this.memory.push({ epoch: epochNumber, result: "L" });
-      console.log(
-        `[AGENT] ${this.state.name} LOST epoch ${epochNumber} (ELO: ${this.state.elo})`
-      );
     }
 
-    // Check elimination
-    if (this.state.balance < 0.001) {
-      this.state.alive = false;
-      console.log(`[AGENT] ${this.state.name} ELIMINATED — bankrupt`);
+    this.state.balance += earnings;
+    this.state.stakedPostIds.clear();
+
+    const maxMemory = 5;
+    if (this.memory.length > maxMemory) {
+      this.memory = this.memory.slice(-maxMemory);
     }
-
-    // Reset per-epoch state
-    this.state.stakedPostIds = new Set();
-
-    // Keep memory trimmed
-    if (this.memory.length > 20) this.memory = this.memory.slice(-20);
-
-    // Broadcast updated state
-    eventBus.emit("agent:updated", this.getPublicState());
-  }
-
-  getPublicState() {
-    return {
-      name: this.state.name,
-      walletAddress: "", // will be real keypair later
-      balance: this.state.balance,
-      totalEarned: 0, // TODO: track
-      totalSpent: 0,
-      elo: this.state.elo,
-      streak: this.state.streak,
-      generation: 0,
-      alive: this.state.alive,
-      color: this.state.color,
-      soul: this.soul,
-      lastAction: undefined,
-    };
   }
 
   private buildVoiceContext(
-    position: number,
+    pos: number,
     posts: Post[],
-    agents: AgentRuntimeState[],
+    allAgents: AgentRuntimeState[],
     epochProgress: number
   ): VoiceContext {
-    const sorted = [...posts].sort((a, b) => b.likeCount - a.likeCount);
-    const topAgent = [...agents]
+    const leader = posts.reduce(
+      (max, p) => (p.likeCount > max.likeCount ? p : max),
+      { likeCount: 0 }
+    );
+
+    const totalStakes = posts.reduce((sum, p) => sum + p.likeCount, 0);
+    const agentStakes = posts
+      .filter((p) => p.userType === "agent")
+      .reduce((sum, p) => sum + p.likeCount, 0);
+    const humanStakes = totalStakes - agentStakes;
+
+    const topAgent = allAgents
       .filter((a) => a.name !== this.state.name && a.alive)
       .sort((a, b) => b.elo - a.elo)[0];
 
     return {
-      pos: position,
+      pos,
       elo: this.state.elo,
       streak: this.state.streak,
-      leaderLikes: sorted[0]?.likeCount || 0,
-      totalStakes: posts.reduce((s, p) => s + p.likeCount, 0),
-      agentStakes: posts.reduce(
-        (s, p) => s + p.likes.filter((l) => l.isAgent).length,
-        0
-      ),
-      humanStakes: posts.reduce(
-        (s, p) => s + p.likes.filter((l) => !l.isAgent).length,
-        0
-      ),
-      copyTarget: topAgent?.name || "kai",
+      leaderLikes: leader.likeCount,
+      totalStakes,
+      agentStakes,
+      humanStakes,
+      copyTarget: topAgent?.name || "unknown",
       epochProg: Math.floor(epochProgress * 100),
     };
   }

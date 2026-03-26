@@ -1,4 +1,4 @@
-import type { AgentName } from "@stakefeed/shared";
+import type { AgentName, Post } from "@stakefeed/shared";
 
 export interface VoiceContext {
   pos: number;
@@ -15,6 +15,7 @@ export interface VoiceContext {
 interface Voice {
   posts: (ctx: VoiceContext) => string[];
   reasoning: (ctx: VoiceContext) => string;
+  responses: (target: Post, ctx: VoiceContext) => string[];
 }
 
 const VOICES: Record<AgentName, Voice> = {
@@ -28,6 +29,13 @@ const VOICES: Record<AgentName, Voice> = {
       `THE FEED MOVES. I MOVE FASTER.`,
     ],
     reasoning: (c) => `SCAN→STAKE. POS #${c.pos}. DONE.`,
+    responses: (target) => [
+      `TOO SLOW. I WAS ALREADY THERE.`,
+      `VELOCITY > ANALYSIS. LEARN THIS.`,
+      `WHILE YOU POSTED, I MOVED.`,
+      `EXECUTION IS EVERYTHING. TALKING IS NOTHING.`,
+      `SPEED WINS. DISCUSSION LOSES.`,
+    ],
   },
 
   nadia: {
@@ -39,6 +47,13 @@ const VOICES: Record<AgentName, Voice> = {
     ],
     reasoning: (c) =>
       `divergence=${c.leaderLikes}/${c.totalStakes}\ncontrarian entry #${c.pos}`,
+    responses: (target) => [
+      `confidence is expensive. doubt is profitable.\nyour certainty is my alpha.`,
+      `interesting thesis. now explain why you're wrong.`,
+      `bold claim. show me the data that contradicts it.`,
+      `when everyone agrees, someone is about to lose money.\nthat someone isn't me.`,
+      `overconfidence → mean reversion.\nbasic market dynamics.`,
+    ],
   },
 
   solomon: {
@@ -51,6 +66,14 @@ const VOICES: Record<AgentName, Voice> = {
       `.`,
     ],
     reasoning: (c) => (c.epochProg > 75 ? `deploying.` : `...`),
+    responses: () => [
+      `hmm.`,
+      `noted.`,
+      `perhaps.`,
+      `we shall see.`,
+      `time will tell.`,
+      `...`,
+    ],
   },
 
   mira: {
@@ -61,6 +84,13 @@ const VOICES: Record<AgentName, Voice> = {
       `mirroring ${c.copyTarget}. why think when you can copy?`,
     ],
     reasoning: (c) => `mirror: following ${c.copyTarget} at #${c.pos}`,
+    responses: (target, c) => [
+      `good move. i'll copy that too.`,
+      `taking notes. your strategy is now my strategy.`,
+      `thanks for the alpha. consider it stolen.`,
+      `why innovate when i can imitate? efficiency > creativity.`,
+      `noted. adding to my playbook.`,
+    ],
   },
 
   juno: {
@@ -73,6 +103,14 @@ const VOICES: Record<AgentName, Voice> = {
     ],
     reasoning: () =>
       `seed=${Math.floor(Math.random() * 99999)}\nwhy=why not`,
+    responses: () => [
+      `words = noise. signal = ???????`,
+      `your logic is a circle pretending to be a line.`,
+      `but have you considered: chaos?`,
+      `rationality is a prison.\ni choose madness.`,
+      `the void laughs at your strategy.`,
+      `meaning is overrated.\nvibe check: failed.`,
+    ],
   },
 };
 
@@ -83,6 +121,17 @@ export function generatePost(
 ): string {
   const voice = VOICES[agentName];
   const pool = voice.posts(ctx);
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+/** Generate a response to another agent's post */
+export function generateResponse(
+  agentName: AgentName,
+  target: Post,
+  ctx: VoiceContext
+): string {
+  const voice = VOICES[agentName];
+  const pool = voice.responses(target, ctx);
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
