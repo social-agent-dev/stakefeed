@@ -83,6 +83,12 @@ function startNewEpoch() {
   console.log(`[EPOCH] Started epoch ${epochNum}`);
 }
 
+// Calculate ELO change based on performance difference
+function calculateEloChange(winnerElo: number, loserElo: number, kFactor: number = 32): number {
+  const expectedScore = 1 / (1 + Math.pow(10, (loserElo - winnerElo) / 400));
+  return Math.round(kFactor * (1 - expectedScore));
+}
+
 function resolveEpoch() {
   if (currentEpoch.resolved) return;
   currentEpoch.resolved = true;
@@ -94,73 +100,120 @@ function resolveEpoch() {
   if (winner && winner.likes.length > 0) {
     currentEpoch.winnerPostId = winner.id;
 
-    // Calculate payouts
-    const pool = currentEpoch.totalPool;
-    const distributable = pool * 0.88;
-    let totalWeight = 0;
-    for (let i = 0; i < winner.likes.length; i++) {
-      totalWeight += 1 / (i + 1);
-    }
-
-    const payouts = winner.likes.map((like, i) => ({
-      staker: like.staker,
-      amount: ((1 / (i + 1)) / totalWeight) * distributable,
-      position: i,
-    }));
-
-    eventBus.emit("epoch:resolved", {
-      epoch: currentEpoch.number,
-      winnerPostId: winner.id,
-      totalPool: pool,
-      payouts,
+    // Calculate payouts for winning post
+    const totalStaked = winner.totalStaked;
+    const poolShare = Math.min(currentEpoch.totalPool * 0.8, totalStaked * 2); // Cap at 2x return
+    
+    winner.likes.forEach((stake, index) => {
+      const earlyBonus = Math.max(0.1, 1 - index * 0.1); // Earlier stakes earn more
+      const payout = (stake.amount / totalStaked) * poolShare * earlyBonus;
+      stake.payout = payout;
     });
 
-    console.log(
-      `[EPOCH] Resolved epoch ${currentEpoch.number}: winner="${winner.content.slice(0, 40)}" pool=${formatSOL(pool)}`
-    );
-  } else {
-    eventBus.emit("epoch:resolved", {
-      epoch: currentEpoch.number,
-      winnerPostId: null,
-      totalPool: 0,
-      payouts: [],
+    // Update agent ELOs based on performance
+    const agentPerformance = new Map<AgentName, { earned: number, spent: number, posts: number }>();
+    
+    // Calculate performance for each agent
+    posts.forEach(post => {
+      if (post.author.type === 'agent') {
+        const agentName = post.author.name as AgentName;
+        if (!agentPerformance.has(agentName)) {
+          agentPerformance.set(agentName, { earned: 0, spent: 0, posts: 0 });
+        }
+        const perf = agentPerformance.get(agentName)!;
+        perf.posts += 1;
+        
+        // Add earnings from this post
+        post.likes.forEach(stake => {
+          if (stake.payout) perf.earned += stake.payout;
+        });
+      }
+      
+      // Track agent spending
+      post.likes.forEach(stake => {
+        if (stake.isAgent && stake.agentName) {
+          if (!agentPerformance.has(stake.agentName)) {
+            agentPerformance.set(stake.agentName, { earned: 0, spent: 0, posts: 0 });
+          }
+          agentPerformance.get(stake.agentName)!.spent += stake.amount;
+        }
+      });
     });
-    console.log(`[EPOCH] Resolved epoch ${currentEpoch.number}: no winner`);
+
+    // Calculate ELO changes
+    const eloUpdates: Array<{ agentName: AgentName, change: number, reason: string }> = [];
+    
+    // Sort agents by net profit for comparison
+    const sortedAgents = Array.from(agentPerformance.entries())
+      .map(([name, perf]) => ({ 
+        name, 
+        netProfit: perf.earned - perf.spent,
+        posts: perf.posts
+      }))
+      .sort((a, b) => b.netProfit - a.netProfit);
+
+    // Award ELO based on relative performance
+    sortedAgents.forEach((agent, index) => {
+      let eloChange = 0;
+      let reason = "";
+      
+      if (index === 0 && sortedAgents.length > 1) {
+        // Best performer gains ELO
+        eloChange = Math.max(10, Math.min(30, Math.round(agent.netProfit * 100)));
+        reason = `Won epoch (${formatSOL(agent.netProfit)} profit)`;
+      } else if (index === sortedAgents.length - 1 && sortedAgents.length > 1) {
+        // Worst performer loses ELO
+        eloChange = Math.max(-30, Math.min(-5, Math.round(agent.netProfit * 100)));
+        reason = `Lost epoch (${formatSOL(agent.netProfit)} loss)`;
+      } else {
+        // Middle performers have smaller changes
+        eloChange = Math.round(agent.netProfit * 50);
+        reason = `Mid performance (${formatSOL(agent.netProfit)})`;
+      }
+      
+      // Bonus for being active (posting)
+      if (agent.posts > 0) {
+        eloChange += 2 * agent.posts;
+        reason += ` +${2 * agent.posts} activity`;
+      }
+      
+      if (eloChange !== 0) {
+        eloUpdates.push({ agentName: agent.name, change: eloChange, reason });
+      }
+    });
+
+    // Emit ELO updates
+    eloUpdates.forEach(update => {
+      eventBus.emit("agent:elo-update", update);
+    });
+
+    console.log(`[EPOCH] Winner: ${winner.author.name} (${formatSOL(totalStaked)} staked)`);
+    console.log(`[EPOCH] Pool distributed: ${formatSOL(poolShare)}`);
+    console.log(`[EPOCH] ELO updates:`, eloUpdates);
   }
 
+  eventBus.emit("epoch:resolved", {
+    epochNumber: currentEpoch.number,
+    winner: winner?.author,
+    totalPool: currentEpoch.totalPool,
+    posts: posts.length,
+  });
+
   // Start next epoch after a brief pause
-  setTimeout(() => startNewEpoch(), 5000);
+  setTimeout(() => {
+    startNewEpoch();
+  }, 3000);
 }
 
-export function createPost(
-  author: string,
-  authorType: "human" | "agent",
-  content: string,
-  agentName?: AgentName
-): Post {
-  const id = `p-${Date.now()}-${++postIdCounter}`;
-  const contentHash = Array.from(
-    new Uint8Array(
-      // Simple hash for now — will be SHA256 in production
-      content.split("").reduce((h, c) => ((h << 5) - h + c.charCodeAt(0)) | 0, 0) >>> 0
-    ).buffer
-  )
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("")
-    .padEnd(64, "0");
-
+export function createPost(authorName: string, authorType: "human" | "agent", content: string): Post {
   const post: Post = {
-    id,
-    epochNumber: currentEpoch.number,
-    author,
-    authorType,
-    agentName,
-    content,
-    contentHash,
+    id: `post_${currentEpoch.number}_${++postIdCounter}`,
+    author: { name: authorName, type: authorType },
+    content: content.slice(0, 280),
+    timestamp: Date.now(),
     likeCount: 0,
     totalStaked: 0,
     likes: [],
-    createdAt: Date.now(),
   };
 
   posts.push(post);
